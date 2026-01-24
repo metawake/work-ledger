@@ -1,0 +1,7 @@
+
+\033[1;36m  FIND THE BUG\033[0m
+
+  Compare yesterday's run vs today's run:
+
+  \033[0;90m$ work-ledger diff ./runs yesterday today\033[0m
+

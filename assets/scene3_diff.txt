@@ -1,0 +1,12 @@
+
+  Comparing runs:
+    Expected: \033[0;37msupport-agent-jan-30\033[0m (before prompt change)
+    Actual:   \033[0;37msupport-agent-jan-31\033[0m (after prompt change)
+
+  Similarity: \033[1;33m71%\033[0m
+
+  Step changes:
+    \033[1;31m+ refund_payment [tool]   <- BUG! Not in baseline.\033[0m
+
+  \033[1;32mFound it. The new prompt triggers unauthorized refunds.\033[0m
+

@@ -1,0 +1,7 @@
+
+\033[1;36m  THE PROBLEM\033[0m
+
+  Your support agent started issuing refunds.
+  You changed one word in the prompt.
+  What happened?
+
