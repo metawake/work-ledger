@@ -1,21 +1,25 @@
 """LangChain integration for Work Ledger.
 
-Thin wrappers that record LangChain chain and agent executions.
+Provides two integration styles:
 
-Example:
+1. **Wrapper** (simple): ``wrap_chain`` / ``wrap_agent`` — wraps invoke calls.
+2. **Callback handler** (idiomatic): ``WorkLedgerCallbackHandler`` —
+   plugs into LangChain's callback system for granular step-level capture.
+
+Callback handler example:
     >>> from langchain_openai import ChatOpenAI
-    >>> from langchain_core.prompts import ChatPromptTemplate
     >>> from work_ledger import WorkLedger
-    >>> from work_ledger.integrations.langchain import wrap_chain
-    >>> 
-    >>> # Build your chain
-    >>> prompt = ChatPromptTemplate.from_template("Answer: {question}")
-    >>> chain = prompt | ChatOpenAI()
-    >>> 
-    >>> # Wrap it
+    >>> from work_ledger.integrations.langchain import WorkLedgerCallbackHandler
+    >>>
     >>> ledger = WorkLedger(store="./runs")
+    >>> handler = WorkLedgerCallbackHandler(ledger)
+    >>> llm = ChatOpenAI(callbacks=[handler])
+    >>> llm.invoke("What is AI?")
+    >>> handler.get_run()  # completed Run with steps
+
+Wrapper example:
+    >>> from work_ledger.integrations.langchain import wrap_chain
     >>> wrapped = wrap_chain(chain, ledger)
-    >>> 
     >>> result = wrapped.invoke({"question": "What is AI?"})
 """
 
@@ -24,12 +28,329 @@ from __future__ import annotations
 import traceback
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
+from uuid import UUID
 
 from work_ledger.core.ledger import WorkLedger
-from work_ledger.core.models import Run, Step, StepKind, RunStatus
+from work_ledger.core.models import Run, Step, StepKind, RunStatus, Metrics
 
 if TYPE_CHECKING:
-    pass
+    from langchain_core.agents import AgentAction, AgentFinish
+    from langchain_core.messages import BaseMessage
+    from langchain_core.outputs import LLMResult
+
+
+class WorkLedgerCallbackHandler:
+    """LangChain BaseCallbackHandler that records runs and steps to WorkLedger.
+
+    Captures LLM calls, tool invocations, chain executions, and retriever
+    queries as structured Steps within a single Run. Attach it via the
+    ``callbacks`` parameter supported by all LangChain runnables.
+
+    Args:
+        ledger: WorkLedger instance for persistence.
+        run_name: Human-readable name for the recorded run.
+        auto_save: If True (default), persist the run when the outermost
+            chain/LLM finishes.  Set to False to call ``save()`` manually.
+
+    Example:
+        >>> handler = WorkLedgerCallbackHandler(ledger, run_name="qa")
+        >>> chain.invoke({"question": "hi"}, config={"callbacks": [handler]})
+        >>> run = handler.get_run()
+    """
+
+    def __init__(
+        self,
+        ledger: WorkLedger,
+        run_name: str = "langchain",
+        auto_save: bool = True,
+    ) -> None:
+        self._ledger = ledger
+        self._run = Run(name=run_name)
+        self._run.status = RunStatus.RUNNING
+        self._run.started_at = datetime.now(timezone.utc)
+        self._auto_save = auto_save
+        self._saved = False
+        self._pending_steps: dict[UUID, Step] = {}
+        self._depth = 0
+
+    # -- public API ----------------------------------------------------------
+
+    def get_run(self) -> Run:
+        """Return the recorded Run (saving first if needed)."""
+        if not self._saved:
+            self.save()
+        return self._run
+
+    def save(self) -> None:
+        """Persist the run to the ledger's store."""
+        if self._saved:
+            return
+        self._run.ended_at = datetime.now(timezone.utc)
+        if self._run.status == RunStatus.RUNNING:
+            self._run.status = RunStatus.SUCCESS
+        self._run.metrics = self._run.aggregate_metrics()
+        self._ledger._save_run(self._run)
+        self._saved = True
+
+    # -- LLM callbacks -------------------------------------------------------
+
+    def on_llm_start(
+        self,
+        serialized: dict[str, Any],
+        prompts: list[str],
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        name = serialized.get("id", ["unknown"])[-1] if serialized.get("id") else "llm"
+        step = Step(name=name, kind=StepKind.MODEL)
+        step.started_at = datetime.now(timezone.utc)
+        step.inputs = {"prompts": prompts}
+        if parent_run_id:
+            parent = self._pending_steps.get(parent_run_id)
+            if parent:
+                step.caused_by = parent.step_id
+        self._pending_steps[run_id] = step
+
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        name = serialized.get("id", ["unknown"])[-1] if serialized.get("id") else "chat_model"
+        step = Step(name=name, kind=StepKind.MODEL)
+        step.started_at = datetime.now(timezone.utc)
+        step.inputs = {
+            "messages": [
+                [{"role": getattr(m, "type", "unknown"), "content": str(m.content)} for m in batch]
+                for batch in messages
+            ]
+        }
+        if parent_run_id:
+            parent = self._pending_steps.get(parent_run_id)
+            if parent:
+                step.caused_by = parent.step_id
+        self._pending_steps[run_id] = step
+
+    def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        step = self._pending_steps.pop(run_id, None)
+        if step is None:
+            return
+        step.ended_at = datetime.now(timezone.utc)
+        generations = response.generations
+        if generations:
+            step.outputs = {
+                "generations": [
+                    [{"text": g.text} for g in batch]
+                    for batch in generations
+                ]
+            }
+        usage = (response.llm_output or {}).get("token_usage", {})
+        step.metrics = Metrics(
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+        )
+        self._run.add_step(step)
+
+    def on_llm_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        step = self._pending_steps.pop(run_id, None)
+        if step is None:
+            return
+        step.ended_at = datetime.now(timezone.utc)
+        step.annotations["error"] = {"type": type(error).__name__, "message": str(error)}
+        self._run.add_step(step)
+        self._run.status = RunStatus.FAILED
+
+    # -- Tool callbacks -------------------------------------------------------
+
+    def on_tool_start(
+        self,
+        serialized: dict[str, Any],
+        input_str: str,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        name = serialized.get("name") or serialized.get("id", ["tool"])[-1] if serialized else "tool"
+        step = Step(name=name, kind=StepKind.TOOL)
+        step.started_at = datetime.now(timezone.utc)
+        step.inputs = {"input": input_str}
+        if parent_run_id:
+            parent = self._pending_steps.get(parent_run_id)
+            if parent:
+                step.caused_by = parent.step_id
+        self._pending_steps[run_id] = step
+
+    def on_tool_end(
+        self,
+        output: str,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        step = self._pending_steps.pop(run_id, None)
+        if step is None:
+            return
+        step.ended_at = datetime.now(timezone.utc)
+        step.outputs = {"output": output}
+        self._run.add_step(step)
+
+    def on_tool_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        step = self._pending_steps.pop(run_id, None)
+        if step is None:
+            return
+        step.ended_at = datetime.now(timezone.utc)
+        step.annotations["error"] = {"type": type(error).__name__, "message": str(error)}
+        self._run.add_step(step)
+
+    # -- Chain callbacks ------------------------------------------------------
+
+    def on_chain_start(
+        self,
+        serialized: dict[str, Any],
+        inputs: dict[str, Any],
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._depth += 1
+        if self._depth == 1:
+            self._run.inputs = inputs if isinstance(inputs, dict) else {"input": str(inputs)}
+
+    def on_chain_end(
+        self,
+        outputs: dict[str, Any],
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        if self._depth == 1:
+            self._run.outputs = outputs if isinstance(outputs, dict) else {"output": str(outputs)}
+            if self._auto_save:
+                self.save()
+        self._depth = max(0, self._depth - 1)
+
+    def on_chain_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        self._run.status = RunStatus.FAILED
+        self._run.annotations["error"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+            "traceback": traceback.format_exc(),
+        }
+        if self._depth == 1 and self._auto_save:
+            self.save()
+        self._depth = max(0, self._depth - 1)
+
+    # -- Retriever callbacks --------------------------------------------------
+
+    def on_retriever_start(
+        self,
+        serialized: dict[str, Any],
+        query: str,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        name = serialized.get("name", "retriever") if serialized else "retriever"
+        step = Step(name=name, kind=StepKind.RETRIEVAL)
+        step.started_at = datetime.now(timezone.utc)
+        step.inputs = {"query": query}
+        if parent_run_id:
+            parent = self._pending_steps.get(parent_run_id)
+            if parent:
+                step.caused_by = parent.step_id
+        self._pending_steps[run_id] = step
+
+    def on_retriever_end(
+        self,
+        documents: list[Any],
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        step = self._pending_steps.pop(run_id, None)
+        if step is None:
+            return
+        step.ended_at = datetime.now(timezone.utc)
+        step.outputs = {
+            "documents": [
+                {"content": getattr(d, "page_content", str(d)), "metadata": getattr(d, "metadata", {})}
+                for d in documents
+            ]
+        }
+        self._run.add_step(step)
+
+    def on_retriever_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        step = self._pending_steps.pop(run_id, None)
+        if step is None:
+            return
+        step.ended_at = datetime.now(timezone.utc)
+        step.annotations["error"] = {"type": type(error).__name__, "message": str(error)}
+        self._run.add_step(step)
+
+    # -- Agent callbacks (optional enrichment) --------------------------------
+
+    def on_agent_action(
+        self,
+        action: AgentAction,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        pass
+
+    def on_agent_finish(
+        self,
+        finish: AgentFinish,
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        pass
+
+    # -- Text callbacks (no-op) -----------------------------------------------
+
+    def on_text(self, text: str, **kwargs: Any) -> None:
+        pass
 
 
 class WrappedChain:
