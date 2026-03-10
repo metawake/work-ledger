@@ -113,6 +113,8 @@ class RunDiff:
     
     steps_added: int = 0
     steps_removed: int = 0
+    added_steps: list[Step] = field(default_factory=list)
+    removed_steps: list[Step] = field(default_factory=list)
     step_diffs: list[StepDiff] = field(default_factory=list)
     
     token_diff: int = 0
@@ -148,6 +150,8 @@ class RunDiff:
         
         self.steps_added = 0
         self.steps_removed = 0
+        self.added_steps: list[Step] = []
+        self.removed_steps: list[Step] = []
         self.step_diffs = []
         
         self.token_diff = 0
@@ -204,9 +208,12 @@ class RunDiff:
         expected_names = set(expected_steps.keys())
         actual_names = set(actual_steps.keys())
         
-        # Count added/removed
-        self.steps_added = len(actual_names - expected_names)
-        self.steps_removed = len(expected_names - actual_names)
+        added_names = actual_names - expected_names
+        removed_names = expected_names - actual_names
+        self.steps_added = len(added_names)
+        self.steps_removed = len(removed_names)
+        self.added_steps = [actual_steps[n] for n in added_names]
+        self.removed_steps = [expected_steps[n] for n in removed_names]
         
         # Compute diffs for common steps
         common = expected_names & actual_names
