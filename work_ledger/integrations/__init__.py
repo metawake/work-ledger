@@ -25,7 +25,7 @@ Direct SDK:
 from work_ledger.integrations.pydantic_ai import wrap_agent
 from work_ledger.integrations.langgraph import wrap_graph
 from work_ledger.integrations.crewai import wrap_crew
-from work_ledger.integrations.langchain import wrap_chain, wrap_agent as wrap_lc_agent
+from work_ledger.integrations.langchain import wrap_chain, wrap_agent as wrap_lc_agent, WorkLedgerCallbackHandler
 from work_ledger.integrations.llamaindex import wrap_query_engine, wrap_chat_engine
 from work_ledger.integrations.openai import wrap_openai
 from work_ledger.integrations.anthropic import wrap_anthropic
@@ -40,6 +40,7 @@ __all__ = [
     # LangChain
     "wrap_chain",
     "wrap_lc_agent",
+    "WorkLedgerCallbackHandler",
     # LlamaIndex
     "wrap_query_engine",
     "wrap_chat_engine",

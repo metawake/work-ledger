@@ -24,6 +24,14 @@ Framework Integrations:
     >>> wrapped = wrap_crew(my_crew, ledger)
     >>> result = wrapped.kickoff(inputs={"topic": "AI"})
 
+LangChain Callback Handler (idiomatic):
+    >>> from work_ledger import WorkLedger, WorkLedgerCallbackHandler
+    >>>
+    >>> ledger = WorkLedger(store="./runs")
+    >>> handler = WorkLedgerCallbackHandler(ledger, run_name="my-chain")
+    >>> chain.invoke({"question": "hi"}, config={"callbacks": [handler]})
+    >>> run = handler.get_run()  # recorded Run with steps
+
 Manual Recording:
     >>> with ledger.run(name="process-request") as run:
     ...     run.record_input({"query": "test"})
@@ -62,7 +70,7 @@ from work_ledger.core.store import (
 )
 from work_ledger.integrations.anthropic import wrap_anthropic
 from work_ledger.integrations.crewai import wrap_crew
-from work_ledger.integrations.langchain import wrap_chain
+from work_ledger.integrations.langchain import wrap_chain, WorkLedgerCallbackHandler
 from work_ledger.integrations.langgraph import wrap_graph
 from work_ledger.integrations.llamaindex import wrap_query_engine
 from work_ledger.integrations.openai import ReplayError, wrap_openai
@@ -95,6 +103,7 @@ __all__ = [
     "wrap_graph",
     "wrap_crew",
     "wrap_chain",
+    "WorkLedgerCallbackHandler",
     "wrap_query_engine",
     "wrap_openai",
     "wrap_anthropic",
