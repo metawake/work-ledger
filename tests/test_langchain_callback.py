@@ -4,7 +4,10 @@ from uuid import uuid4
 
 from work_ledger.core.ledger import WorkLedger
 from work_ledger.core.models import RunStatus, StepKind
-from work_ledger.integrations.langchain import WorkLedgerCallbackHandler
+from work_ledger.integrations.langchain import (
+    WorkLedgerCallbackHandler,
+    _get_base_handler_class,
+)
 
 
 def _make_handler(**kwargs):
@@ -206,3 +209,145 @@ class TestRunNameAndMetrics:
             )
         run = h.get_run()
         assert run.metrics.total_tokens == 30
+
+
+class TestInheritance:
+
+    def test_inherits_from_base_callback_handler(self):
+        from langchain_core.callbacks import BaseCallbackHandler
+        assert issubclass(WorkLedgerCallbackHandler, BaseCallbackHandler)
+
+    def test_isinstance_check_passes(self):
+        from langchain_core.callbacks import BaseCallbackHandler
+        h, _ = _make_handler(auto_save=False)
+        assert isinstance(h, BaseCallbackHandler)
+
+    def test_get_base_handler_class_returns_base(self):
+        from langchain_core.callbacks import BaseCallbackHandler
+        assert _get_base_handler_class() is BaseCallbackHandler
+
+
+class TestSaveIdempotency:
+
+    def test_save_called_twice_only_persists_once(self):
+        h, ledger = _make_handler(auto_save=False)
+        h.save()
+        h.save()
+        assert len(ledger.list_runs()) == 1
+
+    def test_get_run_auto_saves(self):
+        h, ledger = _make_handler(auto_save=False)
+        h.get_run()
+        assert len(ledger.list_runs()) == 1
+
+
+class TestEdgeCases:
+
+    def test_llm_end_without_start_is_ignored(self):
+        h, _ = _make_handler(auto_save=False)
+        h.on_llm_end(_FakeLLMResult(), run_id=uuid4())
+        assert len(h.get_run().steps) == 0
+
+    def test_tool_end_without_start_is_ignored(self):
+        h, _ = _make_handler(auto_save=False)
+        h.on_tool_end("result", run_id=uuid4())
+        assert len(h.get_run().steps) == 0
+
+    def test_tool_error_without_start_is_ignored(self):
+        h, _ = _make_handler(auto_save=False)
+        h.on_tool_error(ValueError("x"), run_id=uuid4())
+        assert len(h.get_run().steps) == 0
+
+    def test_llm_error_without_start_is_ignored(self):
+        h, _ = _make_handler(auto_save=False)
+        h.on_llm_error(RuntimeError("x"), run_id=uuid4())
+        assert len(h.get_run().steps) == 0
+
+    def test_retriever_end_without_start_is_ignored(self):
+        h, _ = _make_handler(auto_save=False)
+        h.on_retriever_end([], run_id=uuid4())
+        assert len(h.get_run().steps) == 0
+
+    def test_retriever_error_without_start_is_ignored(self):
+        h, _ = _make_handler(auto_save=False)
+        h.on_retriever_error(RuntimeError("x"), run_id=uuid4())
+        assert len(h.get_run().steps) == 0
+
+    def test_on_text_is_noop(self):
+        h, _ = _make_handler(auto_save=False)
+        h.on_text("some text")
+        assert len(h.get_run().steps) == 0
+
+    def test_chain_non_dict_input(self):
+        h, _ = _make_handler(auto_save=False)
+        rid = uuid4()
+        h.on_chain_start({}, "plain string", run_id=rid)
+        h.on_chain_end("plain output", run_id=rid)
+        run = h.get_run()
+        assert run.inputs == {"input": "plain string"}
+        assert run.outputs == {"output": "plain output"}
+
+    def test_empty_serialized_defaults_name(self):
+        h, _ = _make_handler(auto_save=False)
+        rid = uuid4()
+        h.on_llm_start({}, ["p"], run_id=rid)
+        h.on_llm_end(_FakeLLMResult(), run_id=rid)
+        assert h.get_run().steps[0].name == "llm"
+
+    def test_llm_end_no_token_usage(self):
+        h, _ = _make_handler(auto_save=False)
+        rid = uuid4()
+        h.on_llm_start({"id": ["m"]}, ["p"], run_id=rid)
+        h.on_llm_end(_FakeLLMResult(llm_output={}), run_id=rid)
+        assert h.get_run().steps[0].metrics.total_tokens == 0
+
+    def test_llm_end_none_llm_output(self):
+        h, _ = _make_handler(auto_save=False)
+        rid = uuid4()
+        h.on_llm_start({"id": ["m"]}, ["p"], run_id=rid)
+        h.on_llm_end(_FakeLLMResult(llm_output=None), run_id=rid)
+        assert h.get_run().steps[0].metrics.total_tokens == 0
+
+
+class TestFullPipeline:
+
+    def test_chain_with_llm_and_tool(self):
+        """Simulate a chain that calls an LLM which then invokes a tool."""
+        h, ledger = _make_handler(auto_save=True)
+        chain_id = uuid4()
+        llm_id = uuid4()
+        tool_id = uuid4()
+
+        h.on_chain_start({}, {"question": "what is 2+2?"}, run_id=chain_id)
+        h.on_llm_start(
+            {"id": ["langchain", "ChatOpenAI"]}, ["what is 2+2?"],
+            run_id=llm_id, parent_run_id=chain_id,
+        )
+        h.on_llm_end(
+            _FakeLLMResult(
+                generations=[[_FakeGeneration("I'll use calculator")]],
+                llm_output={"token_usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}},
+            ),
+            run_id=llm_id,
+        )
+        h.on_tool_start(
+            {"name": "calculator"}, "2+2",
+            run_id=tool_id, parent_run_id=chain_id,
+        )
+        h.on_tool_end("4", run_id=tool_id)
+        h.on_chain_end({"answer": "4"}, run_id=chain_id)
+
+        runs = ledger.list_runs()
+        assert len(runs) == 1
+        run = runs[0]
+        assert run.inputs == {"question": "what is 2+2?"}
+        assert run.outputs == {"answer": "4"}
+        assert run.status == RunStatus.SUCCESS
+        assert len(run.steps) == 2
+        assert run.metrics.total_tokens == 30
+
+        llm_step = [s for s in run.steps if s.kind == StepKind.MODEL][0]
+        tool_step = [s for s in run.steps if s.kind == StepKind.TOOL][0]
+        assert llm_step.name == "ChatOpenAI"
+        assert tool_step.name == "calculator"
+        assert tool_step.outputs["output"] == "4"
