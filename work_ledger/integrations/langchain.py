@@ -39,12 +39,22 @@ if TYPE_CHECKING:
     from langchain_core.outputs import LLMResult
 
 
-class WorkLedgerCallbackHandler:
+def _get_base_handler_class() -> type:
+    """Lazy-import BaseCallbackHandler so langchain-core stays optional."""
+    try:
+        from langchain_core.callbacks import BaseCallbackHandler
+        return BaseCallbackHandler
+    except ImportError:
+        return object
+
+
+class WorkLedgerCallbackHandler(_get_base_handler_class()):
     """LangChain BaseCallbackHandler that records runs and steps to WorkLedger.
 
-    Captures LLM calls, tool invocations, chain executions, and retriever
-    queries as structured Steps within a single Run. Attach it via the
-    ``callbacks`` parameter supported by all LangChain runnables.
+    Inherits from ``langchain_core.callbacks.BaseCallbackHandler`` so it
+    integrates natively with LCEL chains, ``RunnableConfig``, and the
+    LangChain callback manager.  Falls back to a plain class if
+    ``langchain-core`` is not installed (for testing).
 
     Args:
         ledger: WorkLedger instance for persistence.
@@ -64,6 +74,7 @@ class WorkLedgerCallbackHandler:
         run_name: str = "langchain",
         auto_save: bool = True,
     ) -> None:
+        super().__init__()
         self._ledger = ledger
         self._run = Run(name=run_name)
         self._run.status = RunStatus.RUNNING
