@@ -107,8 +107,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"  Tokens: {run.metrics.total_tokens} (prompt: {run.metrics.prompt_tokens}, completion: {run.metrics.completion_tokens})")
     if run.metrics.latency_ms:
         print(f"  Latency: {run.metrics.latency_ms}ms")
-    if run.metrics.cost_usd:
-        print(f"  Cost: ${run.metrics.cost_usd:.4f}")
+    if run.metrics.cost:
+        print(f"  Cost: ${run.metrics.cost:.4f}")
     print()
     
     # Inputs/Outputs
@@ -155,15 +155,26 @@ def cmd_diff(args: argparse.Namespace) -> int:
     diff = RunDiff(run1, run2)
     
     if args.json:
+        metrics_diff = {}
+        if diff.token_diff != 0:
+            metrics_diff["total_tokens"] = {
+                "expected": run1.metrics.total_tokens,
+                "actual": run2.metrics.total_tokens,
+            }
+        if diff.cost_diff != 0:
+            metrics_diff["cost"] = {
+                "expected": run1.metrics.cost or 0.0,
+                "actual": run2.metrics.cost or 0.0,
+            }
         result = {
             "similarity": diff.similarity,
             "has_changes": diff.has_changes,
             "status_changed": diff.status_changed,
             "input_diff": diff.input_diff,
             "output_diff": diff.output_diff,
-            "metrics_diff": diff.metrics_diff,
-            "steps_added": len(diff.steps_added),
-            "steps_removed": len(diff.steps_removed),
+            "metrics_diff": metrics_diff,
+            "steps_added": diff.steps_added,
+            "steps_removed": diff.steps_removed,
         }
         print(json.dumps(result, indent=2, default=str))
         return 0
@@ -203,16 +214,20 @@ def cmd_diff(args: argparse.Namespace) -> int:
     
     if diff.steps_added or diff.steps_removed:
         print("Step changes:")
-        for step in diff.steps_added:
+        for step in diff.added_steps:
             print(f"  + {step.name} [{step.kind.value}]")
-        for step in diff.steps_removed:
+        for step in diff.removed_steps:
             print(f"  - {step.name} [{step.kind.value}]")
         print()
     
-    if diff.metrics_diff:
+    if diff.metrics_changed:
         print("Metric changes:")
-        for k, v in diff.metrics_diff.items():
-            print(f"  {k}: {v['expected']} → {v['actual']}")
+        if diff.token_diff != 0:
+            sign = "+" if diff.token_diff > 0 else ""
+            print(f"  Tokens: {run1.metrics.total_tokens} → {run2.metrics.total_tokens} ({sign}{diff.token_diff})")
+        if diff.cost_diff != 0:
+            sign = "+" if diff.cost_diff > 0 else ""
+            print(f"  Cost: ${run1.metrics.cost or 0:.4f} → ${run2.metrics.cost or 0:.4f} ({sign}${diff.cost_diff:.4f})")
     
     if not diff.has_changes:
         print("No significant changes detected.")
